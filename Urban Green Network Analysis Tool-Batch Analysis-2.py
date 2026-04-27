@@ -191,8 +191,45 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def check_required_columns(df: pd.DataFrame) -> Tuple[bool, List[str]]:
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    """批次上傳只強制檢查最小必要欄位。
+
+    其他欄位若缺漏，系統會以預設值補上，避免舊版表單或簡化表單直接失敗。
+    """
+    core_required = [
+        "代碼",
+        "縣市",
+        "鄉鎮市區",
+        "基地名稱",
+        "TWD97X",
+        "TWD97Y",
+    ]
+    missing = [col for col in core_required if col not in df.columns]
     return len(missing) == 0, missing
+
+
+def ensure_input_defaults(df: pd.DataFrame) -> pd.DataFrame:
+    """補齊非核心欄位，讓批次上傳更耐受。"""
+    data = df.copy()
+
+    defaults = {
+        "距主要道路距離(公尺)": 999,
+        "土地權屬": "其他／待確認",
+        "管理機關": "",
+        "基地面積(公頃)": np.nan,
+        "基地長度(公里)": np.nan,
+        "短期推動性": "待評估",
+        "開放可及性": "待確認",
+    }
+
+    for col, default_value in defaults.items():
+        if col not in data.columns:
+            data[col] = default_value
+
+    for col in YES_NO_COLUMNS:
+        if col not in data.columns:
+            data[col] = "未知"
+
+    return data
 
 
 def clean_numeric(value):
@@ -272,19 +309,41 @@ def euclidean_distances_m(x: float, y: float, points: pd.DataFrame) -> pd.Series
 
 
 def read_optional_csv(filename: str, required_cols: List[str]) -> pd.DataFrame:
+    """讀取外部對照 CSV。
+
+    外部資料來源可能有 UTF-8、Big5、CP950、BOM 或少數壞字元。
+    這裡用多組編碼依序嘗試；若仍失敗，最後以 replacement 方式讀取，
+    避免因單一外部資料檔編碼問題造成整個 App 中斷。
+    """
     if not Path(filename).exists():
         return pd.DataFrame(columns=required_cols)
 
-    try:
-        df = pd.read_csv(filename, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        df = pd.read_csv(filename, encoding="cp950")
+    encodings = ["utf-8-sig", "utf-8", "cp950", "big5", "latin1"]
+    last_error = None
 
-    df = normalize_columns(df)
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-    return df
+    for enc in encodings:
+        try:
+            df = pd.read_csv(filename, encoding=enc, low_memory=False)
+            df = normalize_columns(df)
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = np.nan
+            return df
+        except Exception as e:
+            last_error = e
+
+    try:
+        # 最後保底：用 Python engine 與 errors='replace' 避免壞字元中斷。
+        with open(filename, "r", encoding="utf-8", errors="replace") as f:
+            df = pd.read_csv(f, engine="python", on_bad_lines="skip")
+        df = normalize_columns(df)
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = np.nan
+        return df
+    except Exception:
+        # 若真的完全無法讀取，回傳空表，並讓系統顯示自動補值提醒。
+        return pd.DataFrame(columns=required_cols)
 
 
 # ============================================================
@@ -1169,15 +1228,25 @@ def build_single_site_dataframe() -> pd.DataFrame | None:
 
         with c2:
             if has_town_lookup:
-                county_options = sorted(town_lookup["縣市"].dropna().astype(str).unique())
-                county = st.selectbox("縣市", county_options)
-                town_options = sorted(
-                    town_lookup.loc[town_lookup["縣市"].astype(str) == str(county), "鄉鎮市區"]
-                    .dropna()
-                    .astype(str)
-                    .unique()
+                location_mode = st.radio(
+                    "縣市／鄉鎮市區輸入方式",
+                    ["從對照表選擇", "手動輸入"],
+                    horizontal=True,
                 )
-                town = st.selectbox("鄉鎮市區", town_options)
+
+                if location_mode == "從對照表選擇":
+                    county_options = sorted(town_lookup["縣市"].dropna().astype(str).unique())
+                    county = st.selectbox("縣市", county_options)
+                    town_options = sorted(
+                        town_lookup.loc[town_lookup["縣市"].astype(str) == str(county), "鄉鎮市區"]
+                        .dropna()
+                        .astype(str)
+                        .unique()
+                    )
+                    town = st.selectbox("鄉鎮市區", town_options)
+                else:
+                    county = st.text_input("縣市", value="")
+                    town = st.text_input("鄉鎮市區", value="")
             else:
                 county = st.text_input("縣市", value="")
                 town = st.text_input("鄉鎮市區", value="")
@@ -1327,6 +1396,7 @@ if input_mode == "批次上傳分析":
     with st.expander("查看原始資料"):
         st.dataframe(raw_df, use_container_width=True, hide_index=True)
 
+    raw_df = ensure_input_defaults(raw_df)
     result_df = analyze_green_network(raw_df)
     render_full_results(result_df)
 
